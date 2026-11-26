@@ -1,4 +1,4 @@
-declare module 'jwtguard' {
+declare module '@aarivbuildz/jwtguard' {
   export type Algorithm = 'HS256' | 'HS384' | 'HS512' | 'RS256' | 'PS256' | 'ES256' | 'EdDSA';
   export type DangerousHeader = 'jku' | 'x5u' | 'jwk' | 'x5c';
 

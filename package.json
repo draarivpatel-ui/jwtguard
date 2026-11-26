@@ -1,5 +1,5 @@
 {
-  "name": "jwtguard",
+  "name": "@aarivbuildz/jwtguard",
   "version": "1.0.0",
   "description": "Zero-dependency hardened JWT/JWS signing and strict verification for Node.js with explicit algorithm allowlists and CVE-resistant header policy",
   "type": "module",

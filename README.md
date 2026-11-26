@@ -12,13 +12,13 @@ Zero-dependency hardened JWT/JWS signing and verification for Node.js.
 ## Install
 
 ```sh
-npm install jwtguard
+npm install @aarivbuildz/jwtguard
 ```
 
 ## Quick start
 
 ```js
-import { signJwt, verifyJwt } from 'jwtguard';
+import { signJwt, verifyJwt } from '@aarivbuildz/jwtguard';
 
 const secret = 'a'.repeat(32); // HS256 requires at least 32 bytes
 const token = signJwt(
@@ -37,7 +37,7 @@ const claims = verifyJwt(token, secret, {
 CommonJS works the same way:
 
 ```js
-const { signJwt, verifyJwt } = require('jwtguard');
+const { signJwt, verifyJwt } = require('@aarivbuildz/jwtguard');
 ```
 
 ## Supported algorithms

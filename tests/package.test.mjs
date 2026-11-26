@@ -12,7 +12,7 @@ const require = createRequire(import.meta.url);
 
 test('package.json declares a strict zero-dependency dual module', async () => {
   const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
-  assert.equal(pkg.name, 'jwtguard');
+  assert.equal(pkg.name, '@aarivbuildz/jwtguard');
   assert.equal(pkg.type, 'module');
   assert.equal(pkg.main, './cjs/index.cjs');
   assert.equal(pkg.module, './src/index.mjs');
