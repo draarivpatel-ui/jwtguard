@@ -27,4 +27,5 @@ jobs:
           node scripts/build-cjs.mjs
           diff -u /tmp/jwtguard-cjs-before.cjs cjs/index.cjs
       - name: Run deterministic test suite
-        run: npm test
+        shell: bash
+        run: node --test tests/*.test.mjs
