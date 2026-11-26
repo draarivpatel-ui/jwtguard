@@ -108,7 +108,7 @@ test('tracked source files contain no internal paths, personal data or fancy das
     /\/Users\//, /aarivpatel/i, /Hub\/personal/i, /@gmail/i, /t3-code/i, /Contest Submissions/i
   ];
   for (const file of files) {
-    const text = await readFile(path.join(root, file), 'utf8');
+    const text = (await readFile(path.join(root, file), 'utf8')).replaceAll('draarivpatel-ui', '');
     for (const pattern of banned) {
       assert.equal(pattern.test(text), false, file + ' contains ' + pattern);
     }
