@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [18, 20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Verify generated CommonJS build is current
+        shell: bash
+        run: |
+          cp cjs/index.cjs /tmp/jwtguard-cjs-before.cjs
+          node scripts/build-cjs.mjs
+          diff -u /tmp/jwtguard-cjs-before.cjs cjs/index.cjs
+      - name: Run deterministic test suite
+        run: npm test

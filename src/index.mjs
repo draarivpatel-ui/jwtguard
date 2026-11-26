@@ -1,0 +1,746 @@
+import crypto from 'node:crypto';
+
+/*
+ * jwtguard: a deliberately opinionated JWT/JWS verifier.
+ *
+ * Design rules:
+ *   1. No algorithm guessing. The caller must supply an explicit allowlist.
+ *   2. 'none' is never accepted, under any spelling.
+ *   3. Signing keys are typed. A public PEM can never become an HMAC secret.
+ *   4. Every JSON segment is scanned for duplicate and pollution keys before
+ *      JSON.parse ever sees it.
+ *   5. Signatures are compared in constant time.
+ */
+
+export const ERROR_CODES = Object.freeze({
+  ALGORITHMS_REQUIRED: 'ERR_JWTGUARD_ALGORITHMS_REQUIRED',
+  INVALID_ALGORITHM: 'ERR_JWTGUARD_INVALID_ALGORITHM',
+  ALG_NONE_FORBIDDEN: 'ERR_JWTGUARD_ALG_NONE_FORBIDDEN',
+  MALFORMED_TOKEN: 'ERR_JWTGUARD_MALFORMED_TOKEN',
+  MALFORMED_JSON: 'ERR_JWTGUARD_MALFORMED_JSON',
+  INVALID_BASE64URL: 'ERR_JWTGUARD_INVALID_BASE64URL',
+  DUPLICATE_JSON_KEY: 'ERR_JWTGUARD_DUPLICATE_JSON_KEY',
+  UNSAFE_KEY: 'ERR_JWTGUARD_UNSAFE_KEY',
+  DANGEROUS_HEADER: 'ERR_JWTGUARD_DANGEROUS_HEADER',
+  INVALID_KID: 'ERR_JWTGUARD_INVALID_KID',
+  UNKNOWN_CRIT: 'ERR_JWTGUARD_UNKNOWN_CRIT',
+  KEY_TYPE_MISMATCH: 'ERR_JWTGUARD_KEY_TYPE_MISMATCH',
+  WEAK_SECRET: 'ERR_JWTGUARD_WEAK_SECRET',
+  INVALID_KEY: 'ERR_JWTGUARD_INVALID_KEY',
+  INVALID_SIGNATURE: 'ERR_JWTGUARD_INVALID_SIGNATURE',
+  SIGNATURE_MISMATCH: 'ERR_JWTGUARD_SIGNATURE_MISMATCH',
+  TOKEN_TOO_LARGE: 'ERR_JWTGUARD_TOKEN_TOO_LARGE',
+  EXPIRED: 'ERR_JWTGUARD_EXPIRED',
+  NOT_ACTIVE: 'ERR_JWTGUARD_NOT_ACTIVE',
+  INVALID_IAT: 'ERR_JWTGUARD_INVALID_IAT',
+  INVALID_CLAIM: 'ERR_JWTGUARD_INVALID_CLAIM',
+  MISSING_CLAIM: 'ERR_JWTGUARD_MISSING_CLAIM',
+  ISSUER_MISMATCH: 'ERR_JWTGUARD_ISSUER_MISMATCH',
+  AUDIENCE_MISMATCH: 'ERR_JWTGUARD_AUDIENCE_MISMATCH',
+  SUBJECT_MISMATCH: 'ERR_JWTGUARD_SUBJECT_MISMATCH',
+  JTI_MISMATCH: 'ERR_JWTGUARD_JTI_MISMATCH',
+  INVALID_OPTION: 'ERR_JWTGUARD_INVALID_OPTION'
+});
+
+export const SUPPORTED_ALGORITHMS = Object.freeze([
+  'HS256', 'HS384', 'HS512', 'RS256', 'PS256', 'ES256', 'EdDSA'
+]);
+
+export const DANGEROUS_HEADERS = Object.freeze(['jku', 'x5u', 'jwk', 'x5c']);
+
+const HMAC_MIN_KEY_BYTES = Object.freeze({ HS256: 32, HS384: 48, HS512: 64 });
+const HASH_FOR_ALGORITHM = Object.freeze({
+  HS256: 'sha256', HS384: 'sha384', HS512: 'sha512',
+  RS256: 'sha256', PS256: 'sha256', ES256: 'sha256'
+});
+const ASYMMETRIC_ALGORITHMS = Object.freeze(['RS256', 'PS256', 'ES256', 'EdDSA']);
+const FORBIDDEN_KEYS = Object.freeze(['__proto__', 'constructor', 'prototype']);
+const KNOWN_HEADERS = Object.freeze([
+  'alg', 'jku', 'jwk', 'kid', 'x5u', 'x5c', 'x5t', 'x5t#S256', 'typ', 'cty', 'crit', 'enc', 'zip'
+]);
+const DEFAULT_MAX_TOKEN_BYTES = 16384;
+const MAX_JSON_DEPTH = 100;
+
+export class JwtGuardError extends Error {
+  constructor(code, message, details) {
+    super(message);
+    this.name = 'JwtGuardError';
+    this.code = code;
+    if (details !== undefined) this.details = details;
+  }
+}
+
+function fail(code, message, details) {
+  throw new JwtGuardError(code, message, details);
+}
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function isKeyObject(value) {
+  return typeof crypto.KeyObject === 'function' && value instanceof crypto.KeyObject;
+}
+
+function looksLikePem(material) {
+  const text = Buffer.isBuffer(material) ? material.toString('latin1') : material;
+  return typeof text === 'string' && /-----BEGIN [A-Z ]+-----/.test(text);
+}
+
+function assertNoUnsafeKeys(value, depth = 0) {
+  if (depth > MAX_JSON_DEPTH) fail(ERROR_CODES.INVALID_CLAIM, 'Object nesting is too deep');
+  if (Array.isArray(value)) {
+    for (const item of value) assertNoUnsafeKeys(item, depth + 1);
+    return;
+  }
+  if (!isPlainObject(value)) return;
+  for (const [key, child] of Object.entries(value)) {
+    if (FORBIDDEN_KEYS.includes(key)) {
+      fail(ERROR_CODES.UNSAFE_KEY, 'Rejected prototype-pollution key: ' + key);
+    }
+    assertNoUnsafeKeys(child, depth + 1);
+  }
+}
+
+/*
+ * Strict JSON scanner. JSON.parse collapses duplicate keys silently, so the
+ * source text is walked first and every object key is checked in both raw and
+ * escape-decoded form. This also rejects control characters and deep nesting.
+ */
+function parseStrictJson(text, context) {
+  const malformed = () => fail(
+    ERROR_CODES.MALFORMED_JSON, 'Malformed JSON in ' + context
+  );
+  const length = text.length;
+  let index = 0;
+
+  function skipWhitespace() {
+    while (index < length) {
+      const ch = text[index];
+      if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') index += 1;
+      else break;
+    }
+  }
+
+  function readString() {
+    if (text[index] !== '"') malformed();
+    index += 1;
+    let result = '';
+    while (index < length) {
+      const ch = text[index];
+      index += 1;
+      if (ch === '"') return result;
+      if (ch === '\\') {
+        const escape = text[index];
+        index += 1;
+        if (escape === '"' || escape === '\\' || escape === '/') result += escape;
+        else if (escape === 'b') result += '\b';
+        else if (escape === 'f') result += '\f';
+        else if (escape === 'n') result += '\n';
+        else if (escape === 'r') result += '\r';
+        else if (escape === 't') result += '\t';
+        else if (escape === 'u') {
+          const hex = text.slice(index, index + 4);
+          if (!/^[0-9a-fA-F]{4}$/.test(hex)) malformed();
+          result += String.fromCharCode(parseInt(hex, 16));
+          index += 4;
+        } else malformed();
+      } else {
+        if (ch.charCodeAt(0) < 0x20) malformed();
+        result += ch;
+      }
+    }
+    malformed();
+  }
+
+  function readLength() {
+    const first = text[index];
+    index += 1;
+    if (first === 0x80) malformed();
+    if (first < 0x80) return first;
+    const count = first & 0x7f;
+    if (count < 1 || count > 4 || index + count > length) malformed();
+    let value = 0;
+    for (let i = 0; i < count; i += 1) {
+      value = value * 256 + text.charCodeAt(index);
+      index += 1;
+    }
+    if (value < 128) malformed();
+    return value;
+  }
+
+  function scanValue(depth) {
+    if (depth > MAX_JSON_DEPTH) malformed();
+    skipWhitespace();
+    const ch = text[index];
+    if (ch === '{') {
+      index += 1;
+      skipWhitespace();
+      const seen = new Set();
+      if (text[index] === '}') {
+        index += 1;
+        return;
+      }
+      while (true) {
+        skipWhitespace();
+        const key = readString();
+        if (seen.has(key)) {
+          fail(ERROR_CODES.DUPLICATE_JSON_KEY, 'Duplicate JSON key in ' + context + ': ' + key);
+        }
+        seen.add(key);
+        if (FORBIDDEN_KEYS.includes(key)) {
+          fail(ERROR_CODES.UNSAFE_KEY, 'Rejected prototype-pollution key in ' + context + ': ' + key);
+        }
+        skipWhitespace();
+        if (text[index] !== ':') malformed();
+        index += 1;
+        scanValue(depth + 1);
+        skipWhitespace();
+        const separator = text[index];
+        index += 1;
+        if (separator === '}') return;
+        if (separator !== ',') malformed();
+      }
+    }
+    if (ch === '[') {
+      index += 1;
+      skipWhitespace();
+      if (text[index] === ']') {
+        index += 1;
+        return;
+      }
+      while (true) {
+        scanValue(depth + 1);
+        skipWhitespace();
+        const separator = text[index];
+        index += 1;
+        if (separator === ']') return;
+        if (separator !== ',') malformed();
+      }
+    }
+    if (ch === '"') {
+      readString();
+      return;
+    }
+    const rest = text.slice(index);
+    const number = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(rest);
+    if (number) {
+      index += number[0].length;
+      return;
+    }
+    for (const literal of ['true', 'false', 'null']) {
+      if (rest.startsWith(literal)) {
+        index += literal.length;
+        return;
+      }
+    }
+    malformed();
+  }
+
+  scanValue(0);
+  skipWhitespace();
+  if (index !== length) malformed();
+  try {
+    const parsed = JSON.parse(text);
+    if (!isPlainObject(parsed)) fail(ERROR_CODES.MALFORMED_JSON, context + ' must be a JSON object');
+    return parsed;
+  } catch (error) {
+    if (error instanceof JwtGuardError) throw error;
+    malformed();
+  }
+}
+
+function decodeSegment(segment, context) {
+  if (typeof segment !== 'string' || segment.length === 0) {
+    fail(ERROR_CODES.MALFORMED_TOKEN, 'Empty ' + context + ' segment');
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(segment)) {
+    fail(ERROR_CODES.INVALID_BASE64URL, 'Non-base64url characters in ' + context);
+  }
+  const bytes = Buffer.from(segment, 'base64url');
+  if (bytes.toString('base64url') !== segment) {
+    fail(ERROR_CODES.INVALID_BASE64URL, 'Non-canonical base64url in ' + context);
+  }
+  return bytes;
+}
+
+function decodeSegmentJson(segment, context) {
+  const bytes = decodeSegment(segment, context);
+  return parseStrictJson(bytes.toString('utf8'), context);
+}
+
+function resolveNow(value, context) {
+  let result = value;
+  if (typeof result === 'function') result = result();
+  if (result === undefined) result = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(result)) {
+    fail(ERROR_CODES.INVALID_OPTION, context + ' must return or be an integer number of seconds');
+  }
+  return result;
+}
+
+function validateOptions(options) {
+  if (options === undefined) return {};
+  if (!isPlainObject(options)) fail(ERROR_CODES.INVALID_OPTION, 'Options must be an object');
+  return options;
+}
+
+function allowedDangerousHeaders(options) {
+  const supplied = options.allowDangerousHeaders;
+  if (supplied === undefined) return [];
+  if (!Array.isArray(supplied) || supplied.some((name) => !DANGEROUS_HEADERS.includes(name))) {
+    fail(ERROR_CODES.INVALID_OPTION, 'allowDangerousHeaders accepts only jku, x5u, jwk and x5c');
+  }
+  return supplied;
+}
+
+function validateKid(kid) {
+  if (typeof kid !== 'string' || kid.length === 0 || kid.length > 256) {
+    fail(ERROR_CODES.INVALID_KID, 'kid must be a non-empty string of at most 256 characters');
+  }
+  if (/[\u0000-\u001f\u007f/\\]/.test(kid) || kid.includes('..') || /%2e|%2f|%5c/i.test(kid)) {
+    fail(ERROR_CODES.INVALID_KID, 'kid contains path-traversal or control characters');
+  }
+  if (/['"`;]|--|\/\*|\*\/|\bunion\b|\bselect\b|\bor\b\s+1\s*=\s*1/i.test(kid)) {
+    fail(ERROR_CODES.INVALID_KID, 'kid contains SQL-injection characters');
+  }
+}
+
+function validateHeader(header, options) {
+  if (!isPlainObject(header)) {
+    fail(ERROR_CODES.MALFORMED_TOKEN, 'JWT header must be a JSON object');
+  }
+  if (typeof header.alg !== 'string' || header.alg.length === 0) {
+    fail(ERROR_CODES.INVALID_ALGORITHM, 'JWT header is missing a string alg');
+  }
+  if (header.alg.toLowerCase() === 'none') {
+    fail(ERROR_CODES.ALG_NONE_FORBIDDEN, 'The none algorithm is never accepted');
+  }
+  if (Object.prototype.hasOwnProperty.call(header, 'crit')) {
+    if (!Array.isArray(header.crit) || header.crit.length === 0) {
+      fail(ERROR_CODES.UNKNOWN_CRIT, 'crit must be a non-empty array');
+    }
+    const seen = new Set();
+    for (const name of header.crit) {
+      if (typeof name !== 'string' || name.length === 0 || !KNOWN_HEADERS.includes(name)) {
+        fail(ERROR_CODES.UNKNOWN_CRIT, 'Unknown critical header: ' + String(name));
+      }
+      if (seen.has(name)) fail(ERROR_CODES.UNKNOWN_CRIT, 'Duplicate crit entry: ' + name);
+      seen.add(name);
+    }
+  }
+  const allowed = allowedDangerousHeaders(options);
+  for (const name of DANGEROUS_HEADERS) {
+    if (Object.prototype.hasOwnProperty.call(header, name) && !allowed.includes(name)) {
+      fail(ERROR_CODES.DANGEROUS_HEADER, 'Untrusted header ' + name + ' is blocked by default');
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(header, 'kid')) validateKid(header.kid);
+  return header;
+}
+
+function validateAlgorithmAllowlist(algorithms) {
+  if (!Array.isArray(algorithms) || algorithms.length === 0) {
+    fail(ERROR_CODES.ALGORITHMS_REQUIRED, 'An explicit non-empty algorithms allowlist is required');
+  }
+  for (const algorithm of algorithms) {
+    if (typeof algorithm !== 'string' || algorithm.toLowerCase() === 'none' ||
+        !SUPPORTED_ALGORITHMS.includes(algorithm)) {
+      fail(ERROR_CODES.INVALID_ALGORITHM, 'Unsupported algorithm in allowlist: ' + String(algorithm));
+    }
+  }
+  return algorithms;
+}
+
+function hmacKeyBytes(key, algorithm) {
+  let bytes;
+  if (isKeyObject(key)) {
+    if (key.type !== 'secret') {
+      fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'HMAC requires a symmetric secret, not an asymmetric key object');
+    }
+    bytes = key.export();
+  } else if (Buffer.isBuffer(key)) {
+    if (looksLikePem(key)) {
+      fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'PEM material cannot be used as an HMAC secret');
+    }
+    bytes = key;
+  } else if (typeof key === 'string') {
+    if (looksLikePem(key)) {
+      fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'PEM material cannot be used as an HMAC secret');
+    }
+    bytes = Buffer.from(key, 'utf8');
+  } else {
+    fail(ERROR_CODES.INVALID_KEY, 'HMAC requires a string, Buffer or secret KeyObject');
+  }
+  if (!Buffer.isBuffer(bytes)) fail(ERROR_CODES.INVALID_KEY, 'Could not read secret key bytes');
+  if (bytes.length < HMAC_MIN_KEY_BYTES[algorithm]) {
+    fail(ERROR_CODES.WEAK_SECRET, algorithm + ' requires a secret of at least ' +
+      HMAC_MIN_KEY_BYTES[algorithm] + ' bytes, got ' + bytes.length);
+  }
+  return bytes;
+}
+
+function asymmetricPrivateKey(key) {
+  if (isKeyObject(key)) {
+    if (key.type !== 'private') {
+      fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'Signing requires a private key');
+    }
+    return key;
+  }
+  if ((typeof key === 'string' || Buffer.isBuffer(key)) && looksLikePem(key)) return key;
+  fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'Asymmetric signing requires PEM private key material or a private KeyObject');
+}
+
+function asymmetricPublicKey(key, algorithm) {
+  if (isKeyObject(key) && key.type === 'secret') {
+    fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'A symmetric secret cannot verify an asymmetric signature');
+  }
+  if (!isKeyObject(key) && !(typeof key === 'string' || Buffer.isBuffer(key))) {
+    fail(ERROR_CODES.INVALID_KEY, 'Asymmetric verification requires PEM material or a KeyObject');
+  }
+  if ((typeof key === 'string' || Buffer.isBuffer(key)) && !looksLikePem(key)) {
+    fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'Asymmetric verification requires PEM public key material');
+  }
+  let publicKey;
+  if (isKeyObject(key)) {
+    publicKey = key;
+  } else {
+    try {
+      publicKey = crypto.createPublicKey(key);
+    } catch {
+      fail(ERROR_CODES.INVALID_KEY, 'Could not parse asymmetric public key');
+    }
+  }
+  const type = publicKey.asymmetricKeyType;
+  const curve = publicKey.asymmetricKeyDetails && publicKey.asymmetricKeyDetails.namedCurve;
+  if (algorithm === 'RS256' || algorithm === 'PS256') {
+    if (type !== 'rsa' && type !== 'rsa-pss') {
+      fail(ERROR_CODES.KEY_TYPE_MISMATCH, algorithm + ' requires an RSA key');
+    }
+  } else if (algorithm === 'ES256') {
+    if (type !== 'ec' || (curve !== 'prime256v1' && curve !== 'secp256r1')) {
+      fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'ES256 requires a P-256 EC key');
+    }
+  } else if (algorithm === 'EdDSA') {
+    if (type !== 'ed25519') fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'EdDSA requires an Ed25519 key');
+  }
+  return publicKey;
+}
+
+function integerDerLength(length) {
+  if (length < 128) return Buffer.from([length]);
+  const bytes = [];
+  let remaining = length;
+  while (remaining > 0) {
+    bytes.unshift(remaining & 0xff);
+    remaining = Math.floor(remaining / 256);
+  }
+  return Buffer.from([0x80 | bytes.length, ...bytes]);
+}
+
+function derInteger(value) {
+  let start = 0;
+  while (start < value.length - 1 && value[start] === 0) start += 1;
+  let body = value.subarray(start);
+  if (body[0] & 0x80) body = Buffer.concat([Buffer.from([0]), body]);
+  return Buffer.concat([Buffer.from([0x02, body.length]), body]);
+}
+
+function p1363ToDerP1363(raw, length) {
+  if (!Buffer.isBuffer(raw) || raw.length !== length * 2) return null;
+  const body = Buffer.concat([derInteger(raw.subarray(0, length)), derInteger(raw.subarray(length))]);
+  return Buffer.concat([Buffer.from([0x30]), integerDerLength(body.length), body]);
+}
+
+export function p1363ToDer(signature) {
+  const der = p1363ToDerP1363(signature, 32);
+  if (!der) fail(ERROR_CODES.INVALID_SIGNATURE, 'ES256 signature must be 64 raw bytes');
+  return der;
+}
+
+export function derToP1363(signature) {
+  const bad = () => fail(ERROR_CODES.INVALID_SIGNATURE, 'Malformed DER signature');
+  if (!Buffer.isBuffer(signature) || signature.length < 8 || signature[0] !== 0x30) bad();
+  let index = 1;
+  const first = signature[index];
+  index += 1;
+  let contentLength;
+  if (first < 0x80) contentLength = first;
+  else {
+    const count = first & 0x7f;
+    if (count < 1 || count > 4 || index + count > signature.length) bad();
+    contentLength = 0;
+    for (let i = 0; i < count; i += 1) {
+      contentLength = contentLength * 256 + signature[index];
+      index += 1;
+    }
+  }
+  if (contentLength !== signature.length - index) bad();
+  const readInteger = () => {
+    if (signature[index] !== 0x02) bad();
+    index += 1;
+    const byteLength = signature[index];
+    index += 1;
+    if (byteLength === 0 || byteLength > 33 || index + byteLength > signature.length) bad();
+    let body = signature.subarray(index, index + byteLength);
+    index += byteLength;
+    // Strip at most one leading zero that was added to keep the DER integer positive.
+    if (body.length === 33 && body[0] === 0) body = body.subarray(1);
+    if (body.length === 0 || body.length > 32) bad();
+    const out = Buffer.alloc(32);
+    body.copy(out, 32 - body.length);
+    return out;
+  };
+  const r = readInteger();
+  const s = readInteger();
+  if (index !== signature.length) bad();
+  return Buffer.concat([r, s]);
+}
+
+function createSignature(algorithm, signingInput, key) {
+  if (Object.prototype.hasOwnProperty.call(HASH_FOR_ALGORITHM, algorithm)) {
+    if (algorithm.startsWith('HS')) {
+      return crypto.createHmac(HASH_FOR_ALGORITHM[algorithm], hmacKeyBytes(key, algorithm))
+        .update(signingInput).digest();
+    }
+    if (algorithm === 'RS256') return crypto.sign('sha256', signingInput, key);
+    if (algorithm === 'PS256') {
+      return crypto.sign('sha256', signingInput, {
+        key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32
+      });
+    }
+    return crypto.sign('sha256', signingInput, { key, dsaEncoding: 'ieee-p1363' });
+  }
+  if (algorithm === 'EdDSA') return crypto.sign(null, signingInput, key);
+  fail(ERROR_CODES.INVALID_ALGORITHM, 'Unsupported algorithm: ' + algorithm);
+}
+
+function checkSignature(algorithm, signingInput, signature, key) {
+  if (signature.length === 0) fail(ERROR_CODES.SIGNATURE_MISMATCH, 'Empty signature');
+  if (algorithm.startsWith('HS')) {
+    const expected = crypto.createHmac(HASH_FOR_ALGORITHM[algorithm], hmacKeyBytes(key, algorithm))
+      .update(signingInput).digest();
+    if (expected.length !== signature.length ||
+        !crypto.timingSafeEqual(expected, signature)) {
+      fail(ERROR_CODES.SIGNATURE_MISMATCH, 'HMAC signature does not match');
+    }
+    return;
+  }
+  const publicKey = asymmetricPublicKey(key, algorithm);
+  let valid = false;
+  try {
+    if (algorithm === 'ES256') {
+      const der = p1363ToDerP1363(signature, 32);
+      if (!der) fail(ERROR_CODES.INVALID_SIGNATURE, 'ES256 signature must be 64 raw bytes');
+      valid = crypto.verify('sha256', signingInput, { key: publicKey, dsaEncoding: 'der' }, der);
+    } else if (algorithm === 'PS256') {
+      valid = crypto.verify('sha256', signingInput, {
+        key: publicKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32
+      }, signature);
+    } else if (algorithm === 'RS256') {
+      valid = crypto.verify('sha256', signingInput, publicKey, signature);
+    } else {
+      valid = crypto.verify(null, signingInput, publicKey, signature);
+    }
+  } catch (error) {
+    if (error instanceof JwtGuardError) throw error;
+    fail(ERROR_CODES.INVALID_SIGNATURE, 'Signature encoding is invalid');
+  }
+  if (!valid) fail(ERROR_CODES.SIGNATURE_MISMATCH, 'Signature verification failed');
+}
+
+function requireNumericClaim(payload, name, context) {
+  if (!Object.prototype.hasOwnProperty.call(payload, name)) return undefined;
+  const value = payload[name];
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    fail(ERROR_CODES.INVALID_CLAIM, name + ' in ' + context + ' must be a finite number');
+  }
+  return value;
+}
+
+function matchesOneOrMany(expected, actual) {
+  if (Array.isArray(expected)) return expected.includes(actual);
+  return expected === actual;
+}
+
+function validateClaimSet(payload, options, now, tolerance) {
+  const required = options.requiredClaims === undefined ? ['exp'] : options.requiredClaims;
+  if (!Array.isArray(required) || required.some((name) => typeof name !== 'string' || name.length === 0)) {
+    fail(ERROR_CODES.INVALID_OPTION, 'requiredClaims must be an array of claim names');
+  }
+  for (const name of required) {
+    if (!Object.prototype.hasOwnProperty.call(payload, name) || payload[name] === undefined) {
+      fail(ERROR_CODES.MISSING_CLAIM, 'Required claim missing: ' + name);
+    }
+  }
+
+  const expiration = requireNumericClaim(payload, 'exp', 'payload');
+  if (expiration !== undefined && now >= expiration + tolerance) {
+    fail(ERROR_CODES.EXPIRED, 'Token has expired');
+  }
+  const notBefore = requireNumericClaim(payload, 'nbf', 'payload');
+  if (notBefore !== undefined && now + tolerance < notBefore) {
+    fail(ERROR_CODES.NOT_ACTIVE, 'Token is not active yet');
+  }
+  const issuedAt = requireNumericClaim(payload, 'iat', 'payload');
+  if (issuedAt !== undefined) {
+    if (issuedAt > now + tolerance) {
+      fail(ERROR_CODES.INVALID_IAT, 'Token was issued in the future');
+    }
+    if (options.maxAgeSeconds !== undefined) {
+      if (!Number.isFinite(options.maxAgeSeconds) || options.maxAgeSeconds < 0) {
+        fail(ERROR_CODES.INVALID_OPTION, 'maxAgeSeconds must be a non-negative number');
+      }
+      if (now >= issuedAt + options.maxAgeSeconds + tolerance) {
+        fail(ERROR_CODES.EXPIRED, 'Token exceeds maxAgeSeconds');
+      }
+    }
+  }
+
+  if (options.issuer !== undefined) {
+    if (typeof payload.iss !== 'string' || !matchesOneOrMany(options.issuer, payload.iss)) {
+      fail(ERROR_CODES.ISSUER_MISMATCH, 'Token issuer does not match the allowlist');
+    }
+  }
+  if (options.audience !== undefined) {
+    const actual = payload.aud;
+    let matched = false;
+    if (typeof actual === 'string') matched = matchesOneOrMany(options.audience, actual);
+    else if (Array.isArray(actual)) {
+      const expected = Array.isArray(options.audience) ? options.audience : [options.audience];
+      matched = actual.some((entry) => expected.includes(entry));
+    }
+    if (!matched) fail(ERROR_CODES.AUDIENCE_MISMATCH, 'Token audience does not match the allowlist');
+  }
+  if (options.subject !== undefined) {
+    if (typeof options.subject !== 'string' || payload.sub !== options.subject) {
+      fail(ERROR_CODES.SUBJECT_MISMATCH, 'Token subject does not match');
+    }
+  }
+  if (options.jwtId !== undefined) {
+    if (typeof options.jwtId !== 'string' || payload.jti !== options.jwtId) {
+      fail(ERROR_CODES.JTI_MISMATCH, 'Token jti does not match');
+    }
+  }
+  return payload;
+}
+
+function decodeSegments(token, maxBytes) {
+  if (typeof token !== 'string' || token.length === 0) {
+    fail(ERROR_CODES.MALFORMED_TOKEN, 'Token must be a non-empty string');
+  }
+  if (Buffer.byteLength(token, 'utf8') > maxBytes) {
+    fail(ERROR_CODES.TOKEN_TOO_LARGE, 'Token exceeds the configured byte limit');
+  }
+  const parts = token.split('.');
+  if (parts.length !== 3) {
+    fail(ERROR_CODES.MALFORMED_TOKEN, 'A compact JWS must have exactly three segments');
+  }
+  return {
+    header: decodeSegmentJson(parts[0], 'header'),
+    payload: decodeSegmentJson(parts[1], 'payload'),
+    signature: decodeSegment(parts[2], 'signature'),
+    signingInput: parts[0] + '.' + parts[1]
+  };
+}
+
+function resolveMaxBytes(value) {
+  const limit = value === undefined ? DEFAULT_MAX_TOKEN_BYTES : value;
+  if (!Number.isSafeInteger(limit) || limit < 32) {
+    fail(ERROR_CODES.INVALID_OPTION, 'maxTokenBytes must be an integer of at least 32');
+  }
+  return limit;
+}
+
+function resolveTolerance(value) {
+  const tolerance = value === undefined ? 0 : value;
+  if (!Number.isFinite(tolerance) || tolerance < 0) {
+    fail(ERROR_CODES.INVALID_OPTION, 'clockToleranceSeconds must be a non-negative number');
+  }
+  return tolerance;
+}
+
+export function signJwt(payload, key, options = {}) {
+  const opts = validateOptions(options);
+  if (typeof opts.algorithm !== 'string' || !SUPPORTED_ALGORITHMS.includes(opts.algorithm) ||
+      opts.algorithm.toLowerCase() === 'none') {
+    fail(ERROR_CODES.INVALID_ALGORITHM, 'signJwt requires an explicit supported algorithm');
+  }
+  if (!isPlainObject(payload)) fail(ERROR_CODES.INVALID_CLAIM, 'Payload must be a plain object');
+  assertNoUnsafeKeys(payload);
+
+  const header = { typ: 'JWT', ...(opts.header || {}), alg: opts.algorithm };
+  if (!isPlainObject(header)) fail(ERROR_CODES.MALFORMED_TOKEN, 'header must be an object');
+  assertNoUnsafeKeys(header);
+  validateHeader(header, opts);
+
+  const now = resolveNow(opts.now, 'now');
+  const claims = { ...payload };
+  if (opts.noTimestamp !== true) claims.iat = now;
+  if (opts.notBeforeSeconds !== undefined) {
+    if (!Number.isFinite(opts.notBeforeSeconds)) {
+      fail(ERROR_CODES.INVALID_OPTION, 'notBeforeSeconds must be a finite number');
+    }
+    claims.nbf = now + opts.notBeforeSeconds;
+  }
+  if (opts.expiresInSeconds !== undefined) {
+    if (!Number.isFinite(opts.expiresInSeconds) || opts.expiresInSeconds < 0) {
+      fail(ERROR_CODES.INVALID_OPTION, 'expiresInSeconds must be a non-negative number');
+    }
+    claims.exp = now + opts.expiresInSeconds;
+  }
+
+  const encodedHeader = Buffer.from(JSON.stringify(header)).toString('base64url');
+  const encodedPayload = Buffer.from(JSON.stringify(claims)).toString('base64url');
+  const signingInput = encodedHeader + '.' + encodedPayload;
+  let signingKey = key;
+  if (opts.algorithm.startsWith('HS')) hmacKeyBytes(key, opts.algorithm);
+  else if (ASYMMETRIC_ALGORITHMS.includes(opts.algorithm)) signingKey = asymmetricPrivateKey(key);
+  const signature = createSignature(opts.algorithm, signingInput, signingKey).toString('base64url');
+  const token = signingInput + '.' + signature;
+  if (Buffer.byteLength(token, 'utf8') > resolveMaxBytes(opts.maxTokenBytes)) {
+    fail(ERROR_CODES.TOKEN_TOO_LARGE, 'Signed token exceeds the configured byte limit');
+  }
+  return token;
+}
+
+export function verifyJwt(token, key, options = {}) {
+  const opts = validateOptions(options);
+  const algorithms = validateAlgorithmAllowlist(opts.algorithms);
+  const decoded = decodeSegments(token, resolveMaxBytes(opts.maxTokenBytes));
+  const header = validateHeader(decoded.header, opts);
+  if (!algorithms.includes(header.alg)) {
+    fail(ERROR_CODES.INVALID_ALGORITHM, 'Header alg is not in the explicit allowlist: ' + header.alg);
+  }
+  if (ASYMMETRIC_ALGORITHMS.includes(header.alg)) asymmetricPublicKey(key, header.alg);
+  else hmacKeyBytes(key, header.alg);
+  checkSignature(header.alg, decoded.signingInput, decoded.signature, key);
+  const now = resolveNow(opts.now, 'now');
+  return validateClaimSet(decoded.payload, opts, now, resolveTolerance(opts.clockToleranceSeconds));
+}
+
+export function decodeJwtUnsafe(token, options = {}) {
+  const opts = validateOptions(options);
+  const decoded = decodeSegments(token, resolveMaxBytes(opts.maxTokenBytes));
+  return {
+    header: decoded.header,
+    payload: decoded.payload,
+    signature: decoded.signature,
+    signingInput: decoded.signingInput
+  };
+}
+
+export function inspectJwtHeader(token, options = {}) {
+  const opts = validateOptions(options);
+  const decoded = decodeSegments(token, resolveMaxBytes(opts.maxTokenBytes));
+  return opts.enforcePolicy === true ? validateHeader(decoded.header, opts) : decoded.header;
+}
+
+const api = {
+  JwtGuardError, ERROR_CODES, SUPPORTED_ALGORITHMS, DANGEROUS_HEADERS,
+  signJwt, verifyJwt, decodeJwtUnsafe, inspectJwtHeader, p1363ToDer, derToP1363
+};
+
+export default api;

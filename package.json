@@ -1,0 +1,49 @@
+{
+  "name": "jwtguard",
+  "version": "1.0.0",
+  "description": "Zero-dependency hardened JWT/JWS signing and strict verification for Node.js with explicit algorithm allowlists and CVE-resistant header policy",
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./src/index.mjs",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./src/index.mjs",
+      "require": "./cjs/index.cjs"
+    }
+  },
+  "files": [
+    "src",
+    "cjs",
+    "types",
+    "README.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "GOOD_FIRST_ISSUES.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:cjs": "node scripts/build-cjs.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "jwt",
+    "jws",
+    "security",
+    "verification",
+    "hmac",
+    "rs256",
+    "ps256",
+    "es256",
+    "eddsa",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "sideEffects": false,
+  "dependencies": {},
+  "devDependencies": {}
+}
