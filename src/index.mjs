@@ -26,6 +26,7 @@ export const ERROR_CODES = Object.freeze({
   UNKNOWN_CRIT: 'ERR_JWTGUARD_UNKNOWN_CRIT',
   KEY_TYPE_MISMATCH: 'ERR_JWTGUARD_KEY_TYPE_MISMATCH',
   WEAK_SECRET: 'ERR_JWTGUARD_WEAK_SECRET',
+  WEAK_KEY: 'ERR_JWTGUARD_WEAK_KEY',
   INVALID_KEY: 'ERR_JWTGUARD_INVALID_KEY',
   INVALID_SIGNATURE: 'ERR_JWTGUARD_INVALID_SIGNATURE',
   SIGNATURE_MISMATCH: 'ERR_JWTGUARD_SIGNATURE_MISMATCH',
@@ -55,11 +56,17 @@ const HASH_FOR_ALGORITHM = Object.freeze({
 });
 const ASYMMETRIC_ALGORITHMS = Object.freeze(['RS256', 'PS256', 'ES256', 'EdDSA']);
 const FORBIDDEN_KEYS = Object.freeze(['__proto__', 'constructor', 'prototype']);
-const KNOWN_HEADERS = Object.freeze([
-  'alg', 'jku', 'jwk', 'kid', 'x5u', 'x5c', 'x5t', 'x5t#S256', 'typ', 'cty', 'crit', 'enc', 'zip'
+// Header names registered by RFC 7515 and RFC 7516. RFC 7515 section 4.1.11
+// forbids listing any of these in crit. This library implements no crit
+// extensions, so every crit member is either registered (forbidden) or
+// unknown (unprocessable), and both cases are rejected.
+const REGISTERED_HEADERS = Object.freeze([
+  'alg', 'jku', 'jwk', 'kid', 'x5u', 'x5c', 'x5t', 'x5t#S256', 'typ', 'cty',
+  'crit', 'enc', 'zip', 'b64'
 ]);
 const DEFAULT_MAX_TOKEN_BYTES = 16384;
 const MAX_JSON_DEPTH = 100;
+const MIN_RSA_MODULUS_BITS = 2048;
 
 export class JwtGuardError extends Error {
   constructor(code, message, details) {
@@ -84,15 +91,61 @@ function isKeyObject(value) {
   return typeof crypto.KeyObject === 'function' && value instanceof crypto.KeyObject;
 }
 
-function looksLikePem(material) {
-  const text = Buffer.isBuffer(material) ? material.toString('latin1') : material;
-  return typeof text === 'string' && /-----BEGIN [A-Z ]+-----/.test(text);
+// Everything key-shaped goes through here: string PEM stays a string, while
+// Buffer and plain Uint8Array material is normalized to a Buffer view.
+function toKeyBytes(material) {
+  if (typeof material === 'string') return material;
+  if (Buffer.isBuffer(material)) return material;
+  if (material instanceof Uint8Array) {
+    return Buffer.from(material.buffer, material.byteOffset, material.byteLength);
+  }
+  return null;
 }
 
-function assertNoUnsafeKeys(value, depth = 0) {
-  if (depth > MAX_JSON_DEPTH) fail(ERROR_CODES.INVALID_CLAIM, 'Object nesting is too deep');
+function looksLikePem(material) {
+  const bytes = toKeyBytes(material);
+  if (typeof bytes === 'string') return /-----BEGIN [A-Z ]+-----/.test(bytes);
+  return bytes !== null && /-----BEGIN [A-Z ]+-----/.test(bytes.toString('latin1'));
+}
+
+/*
+ * Raw DER key material carries no PEM armor, so the string check cannot see
+ * it. Probe the common DER containers so a SubjectPublicKeyInfo blob can
+ * never be repurposed as an HMAC secret (algorithm confusion). Only bytes
+ * that start with an ASN.1 SEQUENCE tag are considered.
+ */
+function looksLikeDerKey(material) {
+  const bytes = toKeyBytes(material);
+  if (bytes === null || typeof bytes === 'string' || bytes.length < 32 || bytes[0] !== 0x30) {
+    return false;
+  }
+  const probes = [
+    () => crypto.createPublicKey({ key: bytes, format: 'der', type: 'spki' }),
+    () => crypto.createPublicKey({ key: bytes, format: 'der', type: 'pkcs1' }),
+    () => crypto.createPrivateKey({ key: bytes, format: 'der', type: 'pkcs8' }),
+    () => crypto.createPrivateKey({ key: bytes, format: 'der', type: 'pkcs1' }),
+    () => crypto.createPrivateKey({ key: bytes, format: 'der', type: 'sec1' })
+  ];
+  for (const probe of probes) {
+    try {
+      probe();
+      return true;
+    } catch {
+      /* not this container; keep probing */
+    }
+  }
+  return false;
+}
+
+function assertNoUnsafeKeys(value, label, depth = 0) {
+  if (depth > MAX_JSON_DEPTH) {
+    fail(ERROR_CODES.INVALID_CLAIM, label + ' nesting is too deep');
+  }
+  if (typeof value === 'function') {
+    fail(ERROR_CODES.INVALID_CLAIM, label + ' must contain only JSON data; functions are not allowed');
+  }
   if (Array.isArray(value)) {
-    for (const item of value) assertNoUnsafeKeys(item, depth + 1);
+    for (const item of value) assertNoUnsafeKeys(item, label, depth + 1);
     return;
   }
   if (!isPlainObject(value)) return;
@@ -100,7 +153,7 @@ function assertNoUnsafeKeys(value, depth = 0) {
     if (FORBIDDEN_KEYS.includes(key)) {
       fail(ERROR_CODES.UNSAFE_KEY, 'Rejected prototype-pollution key: ' + key);
     }
-    assertNoUnsafeKeys(child, depth + 1);
+    assertNoUnsafeKeys(child, label, depth + 1);
   }
 }
 
@@ -153,22 +206,6 @@ function parseStrictJson(text, context) {
       }
     }
     malformed();
-  }
-
-  function readLength() {
-    const first = text[index];
-    index += 1;
-    if (first === 0x80) malformed();
-    if (first < 0x80) return first;
-    const count = first & 0x7f;
-    if (count < 1 || count > 4 || index + count > length) malformed();
-    let value = 0;
-    for (let i = 0; i < count; i += 1) {
-      value = value * 256 + text.charCodeAt(index);
-      index += 1;
-    }
-    if (value < 128) malformed();
-    return value;
   }
 
   function scanValue(depth) {
@@ -318,26 +355,34 @@ function validateHeader(header, options) {
   if (header.alg.toLowerCase() === 'none') {
     fail(ERROR_CODES.ALG_NONE_FORBIDDEN, 'The none algorithm is never accepted');
   }
+  const allowedDangerous = allowedDangerousHeaders(options);
+  for (const name of DANGEROUS_HEADERS) {
+    if (Object.prototype.hasOwnProperty.call(header, name) && !allowedDangerous.includes(name)) {
+      fail(ERROR_CODES.DANGEROUS_HEADER, 'Untrusted header ' + name + ' is blocked by default');
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(header, 'kid')) validateKid(header.kid);
   if (Object.prototype.hasOwnProperty.call(header, 'crit')) {
     if (!Array.isArray(header.crit) || header.crit.length === 0) {
       fail(ERROR_CODES.UNKNOWN_CRIT, 'crit must be a non-empty array');
     }
     const seen = new Set();
     for (const name of header.crit) {
-      if (typeof name !== 'string' || name.length === 0 || !KNOWN_HEADERS.includes(name)) {
-        fail(ERROR_CODES.UNKNOWN_CRIT, 'Unknown critical header: ' + String(name));
+      if (typeof name !== 'string' || name.length === 0) {
+        fail(ERROR_CODES.UNKNOWN_CRIT, 'crit entries must be non-empty strings');
       }
       if (seen.has(name)) fail(ERROR_CODES.UNKNOWN_CRIT, 'Duplicate crit entry: ' + name);
       seen.add(name);
     }
-  }
-  const allowed = allowedDangerousHeaders(options);
-  for (const name of DANGEROUS_HEADERS) {
-    if (Object.prototype.hasOwnProperty.call(header, name) && !allowed.includes(name)) {
-      fail(ERROR_CODES.DANGEROUS_HEADER, 'Untrusted header ' + name + ' is blocked by default');
+    // RFC 7515 section 4.1.11 forbids naming a registered header in crit, and
+    // this library implements no crit extensions, so every crit array is
+    // rejected. The two branches keep the reason precise for callers.
+    const critical = header.crit[0];
+    if (REGISTERED_HEADERS.includes(critical)) {
+      fail(ERROR_CODES.UNKNOWN_CRIT, 'crit must not name a registered header: ' + critical);
     }
+    fail(ERROR_CODES.UNKNOWN_CRIT, 'Unknown critical header: ' + critical);
   }
-  if (Object.prototype.hasOwnProperty.call(header, 'kid')) validateKid(header.kid);
   return header;
 }
 
@@ -361,18 +406,15 @@ function hmacKeyBytes(key, algorithm) {
       fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'HMAC requires a symmetric secret, not an asymmetric key object');
     }
     bytes = key.export();
-  } else if (Buffer.isBuffer(key)) {
-    if (looksLikePem(key)) {
-      fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'PEM material cannot be used as an HMAC secret');
-    }
-    bytes = key;
-  } else if (typeof key === 'string') {
-    if (looksLikePem(key)) {
-      fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'PEM material cannot be used as an HMAC secret');
-    }
-    bytes = Buffer.from(key, 'utf8');
   } else {
-    fail(ERROR_CODES.INVALID_KEY, 'HMAC requires a string, Buffer or secret KeyObject');
+    const material = toKeyBytes(key);
+    if (material === null) {
+      fail(ERROR_CODES.INVALID_KEY, 'HMAC requires a string, Buffer, Uint8Array or secret KeyObject');
+    }
+    if (looksLikePem(material) || looksLikeDerKey(material)) {
+      fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'Asymmetric key material cannot be used as an HMAC secret');
+    }
+    bytes = typeof material === 'string' ? Buffer.from(material, 'utf8') : material;
   }
   if (!Buffer.isBuffer(bytes)) fail(ERROR_CODES.INVALID_KEY, 'Could not read secret key bytes');
   if (bytes.length < HMAC_MIN_KEY_BYTES[algorithm]) {
@@ -382,42 +424,18 @@ function hmacKeyBytes(key, algorithm) {
   return bytes;
 }
 
-function asymmetricPrivateKey(key) {
-  if (isKeyObject(key)) {
-    if (key.type !== 'private') {
-      fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'Signing requires a private key');
-    }
-    return key;
-  }
-  if ((typeof key === 'string' || Buffer.isBuffer(key)) && looksLikePem(key)) return key;
-  fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'Asymmetric signing requires PEM private key material or a private KeyObject');
-}
-
-function asymmetricPublicKey(key, algorithm) {
-  if (isKeyObject(key) && key.type === 'secret') {
-    fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'A symmetric secret cannot verify an asymmetric signature');
-  }
-  if (!isKeyObject(key) && !(typeof key === 'string' || Buffer.isBuffer(key))) {
-    fail(ERROR_CODES.INVALID_KEY, 'Asymmetric verification requires PEM material or a KeyObject');
-  }
-  if ((typeof key === 'string' || Buffer.isBuffer(key)) && !looksLikePem(key)) {
-    fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'Asymmetric verification requires PEM public key material');
-  }
-  let publicKey;
-  if (isKeyObject(key)) {
-    publicKey = key;
-  } else {
-    try {
-      publicKey = crypto.createPublicKey(key);
-    } catch {
-      fail(ERROR_CODES.INVALID_KEY, 'Could not parse asymmetric public key');
-    }
-  }
+// Shared family and curve policy for both signing and verification keys.
+function assertAsymmetricKey(publicKey, algorithm) {
   const type = publicKey.asymmetricKeyType;
-  const curve = publicKey.asymmetricKeyDetails && publicKey.asymmetricKeyDetails.namedCurve;
+  const details = publicKey.asymmetricKeyDetails || {};
+  const curve = details.namedCurve;
   if (algorithm === 'RS256' || algorithm === 'PS256') {
     if (type !== 'rsa' && type !== 'rsa-pss') {
       fail(ERROR_CODES.KEY_TYPE_MISMATCH, algorithm + ' requires an RSA key');
+    }
+    if (!Number.isInteger(details.modulusLength) || details.modulusLength < MIN_RSA_MODULUS_BITS) {
+      fail(ERROR_CODES.WEAK_KEY, algorithm + ' requires an RSA modulus of at least ' +
+        MIN_RSA_MODULUS_BITS + ' bits');
     }
   } else if (algorithm === 'ES256') {
     if (type !== 'ec' || (curve !== 'prime256v1' && curve !== 'secp256r1')) {
@@ -427,6 +445,59 @@ function asymmetricPublicKey(key, algorithm) {
     if (type !== 'ed25519') fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'EdDSA requires an Ed25519 key');
   }
   return publicKey;
+}
+
+function asymmetricPrivateKey(key, algorithm) {
+  let privateKey;
+  if (isKeyObject(key)) {
+    privateKey = key;
+  } else {
+    const material = toKeyBytes(key);
+    if (material === null || !looksLikePem(material)) {
+      fail(ERROR_CODES.KEY_TYPE_MISMATCH,
+        'Asymmetric signing requires PEM private key material or a private KeyObject');
+    }
+    try {
+      privateKey = crypto.createPrivateKey(material);
+    } catch {
+      fail(ERROR_CODES.INVALID_KEY, 'Could not parse asymmetric private key');
+    }
+  }
+  if (privateKey.type !== 'private') {
+    fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'Signing requires a private key');
+  }
+  let publicKey;
+  try {
+    publicKey = crypto.createPublicKey(privateKey);
+  } catch {
+    fail(ERROR_CODES.INVALID_KEY, 'Could not derive a public key for key policy checks');
+  }
+  assertAsymmetricKey(publicKey, algorithm);
+  return privateKey;
+}
+
+function asymmetricPublicKey(key, algorithm) {
+  if (isKeyObject(key) && key.type === 'secret') {
+    fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'A symmetric secret cannot verify an asymmetric signature');
+  }
+  let publicKey;
+  if (isKeyObject(key)) {
+    publicKey = key;
+  } else {
+    const material = toKeyBytes(key);
+    if (material === null) {
+      fail(ERROR_CODES.INVALID_KEY, 'Asymmetric verification requires PEM material or a KeyObject');
+    }
+    if (!looksLikePem(material)) {
+      fail(ERROR_CODES.KEY_TYPE_MISMATCH, 'Asymmetric verification requires PEM public key material');
+    }
+    try {
+      publicKey = crypto.createPublicKey(material);
+    } catch {
+      fail(ERROR_CODES.INVALID_KEY, 'Could not parse asymmetric public key');
+    }
+  }
+  return assertAsymmetricKey(publicKey, algorithm);
 }
 
 function integerDerLength(length) {
@@ -455,37 +526,45 @@ function p1363ToDerP1363(raw, length) {
 }
 
 export function p1363ToDer(signature) {
-  const der = p1363ToDerP1363(signature, 32);
+  const raw = toKeyBytes(signature);
+  const der = Buffer.isBuffer(raw) ? p1363ToDerP1363(raw, 32) : null;
   if (!der) fail(ERROR_CODES.INVALID_SIGNATURE, 'ES256 signature must be 64 raw bytes');
   return der;
 }
 
 export function derToP1363(signature) {
   const bad = () => fail(ERROR_CODES.INVALID_SIGNATURE, 'Malformed DER signature');
-  if (!Buffer.isBuffer(signature) || signature.length < 8 || signature[0] !== 0x30) bad();
+  const bytes = toKeyBytes(signature);
+  if (!Buffer.isBuffer(bytes) || bytes.length < 8 || bytes[0] !== 0x30) bad();
   let index = 1;
-  const first = signature[index];
+  const first = bytes[index];
   index += 1;
   let contentLength;
   if (first < 0x80) contentLength = first;
   else {
     const count = first & 0x7f;
-    if (count < 1 || count > 4 || index + count > signature.length) bad();
+    if (count < 1 || count > 4 || index + count > bytes.length) bad();
     contentLength = 0;
     for (let i = 0; i < count; i += 1) {
-      contentLength = contentLength * 256 + signature[index];
+      contentLength = contentLength * 256 + bytes[index];
       index += 1;
     }
   }
-  if (contentLength !== signature.length - index) bad();
+  if (contentLength !== bytes.length - index) bad();
   const readInteger = () => {
-    if (signature[index] !== 0x02) bad();
+    if (bytes[index] !== 0x02) bad();
     index += 1;
-    const byteLength = signature[index];
+    const byteLength = bytes[index];
     index += 1;
-    if (byteLength === 0 || byteLength > 33 || index + byteLength > signature.length) bad();
-    let body = signature.subarray(index, index + byteLength);
+    if (byteLength === 0 || byteLength > 33 || index + byteLength > bytes.length) bad();
+    let body = bytes.subarray(index, index + byteLength);
     index += byteLength;
+    // A high bit on the first encoded byte means a negative INTEGER, which is
+    // never valid for ECDSA.
+    if ((body[0] & 0x80) !== 0) bad();
+    // DER integers are minimal: a leading zero is only allowed to keep a value
+    // whose next byte has the high bit set positive.
+    if (body.length > 1 && body[0] === 0 && (body[1] & 0x80) === 0) bad();
     // Strip at most one leading zero that was added to keep the DER integer positive.
     if (body.length === 33 && body[0] === 0) body = body.subarray(1);
     if (body.length === 0 || body.length > 32) bad();
@@ -495,7 +574,7 @@ export function derToP1363(signature) {
   };
   const r = readInteger();
   const s = readInteger();
-  if (index !== signature.length) bad();
+  if (index !== bytes.length) bad();
   return Buffer.concat([r, s]);
 }
 
@@ -584,18 +663,22 @@ function validateClaimSet(payload, options, now, tolerance) {
   if (notBefore !== undefined && now + tolerance < notBefore) {
     fail(ERROR_CODES.NOT_ACTIVE, 'Token is not active yet');
   }
+  const maxAge = options.maxAgeSeconds;
+  if (maxAge !== undefined && (!Number.isFinite(maxAge) || maxAge < 0)) {
+    fail(ERROR_CODES.INVALID_OPTION, 'maxAgeSeconds must be a non-negative number');
+  }
   const issuedAt = requireNumericClaim(payload, 'iat', 'payload');
-  if (issuedAt !== undefined) {
-    if (issuedAt > now + tolerance) {
-      fail(ERROR_CODES.INVALID_IAT, 'Token was issued in the future');
+  if (issuedAt !== undefined && issuedAt > now + tolerance) {
+    fail(ERROR_CODES.INVALID_IAT, 'Token was issued in the future');
+  }
+  if (maxAge !== undefined) {
+    // Without iat there is nothing to age against. Refusing is the only safe
+    // choice: skipping the check would silently disable maxAgeSeconds.
+    if (issuedAt === undefined) {
+      fail(ERROR_CODES.MISSING_CLAIM, 'maxAgeSeconds requires an iat claim');
     }
-    if (options.maxAgeSeconds !== undefined) {
-      if (!Number.isFinite(options.maxAgeSeconds) || options.maxAgeSeconds < 0) {
-        fail(ERROR_CODES.INVALID_OPTION, 'maxAgeSeconds must be a non-negative number');
-      }
-      if (now >= issuedAt + options.maxAgeSeconds + tolerance) {
-        fail(ERROR_CODES.EXPIRED, 'Token exceeds maxAgeSeconds');
-      }
+    if (now >= issuedAt + maxAge + tolerance) {
+      fail(ERROR_CODES.EXPIRED, 'Token exceeds maxAgeSeconds');
     }
   }
 
@@ -669,11 +752,13 @@ export function signJwt(payload, key, options = {}) {
     fail(ERROR_CODES.INVALID_ALGORITHM, 'signJwt requires an explicit supported algorithm');
   }
   if (!isPlainObject(payload)) fail(ERROR_CODES.INVALID_CLAIM, 'Payload must be a plain object');
-  assertNoUnsafeKeys(payload);
+  assertNoUnsafeKeys(payload, 'payload');
+  if (opts.header !== undefined && !isPlainObject(opts.header)) {
+    fail(ERROR_CODES.INVALID_OPTION, 'header must be a plain object');
+  }
 
   const header = { typ: 'JWT', ...(opts.header || {}), alg: opts.algorithm };
-  if (!isPlainObject(header)) fail(ERROR_CODES.MALFORMED_TOKEN, 'header must be an object');
-  assertNoUnsafeKeys(header);
+  assertNoUnsafeKeys(header, 'header');
   validateHeader(header, opts);
 
   const now = resolveNow(opts.now, 'now');
@@ -697,8 +782,17 @@ export function signJwt(payload, key, options = {}) {
   const signingInput = encodedHeader + '.' + encodedPayload;
   let signingKey = key;
   if (opts.algorithm.startsWith('HS')) hmacKeyBytes(key, opts.algorithm);
-  else if (ASYMMETRIC_ALGORITHMS.includes(opts.algorithm)) signingKey = asymmetricPrivateKey(key);
-  const signature = createSignature(opts.algorithm, signingInput, signingKey).toString('base64url');
+  else if (ASYMMETRIC_ALGORITHMS.includes(opts.algorithm)) {
+    signingKey = asymmetricPrivateKey(key, opts.algorithm);
+  }
+  let signatureBytes;
+  try {
+    signatureBytes = createSignature(opts.algorithm, signingInput, signingKey);
+  } catch (error) {
+    if (error instanceof JwtGuardError) throw error;
+    fail(ERROR_CODES.INVALID_KEY, 'Signing failed for the supplied key material');
+  }
+  const signature = signatureBytes.toString('base64url');
   const token = signingInput + '.' + signature;
   if (Buffer.byteLength(token, 'utf8') > resolveMaxBytes(opts.maxTokenBytes)) {
     fail(ERROR_CODES.TOKEN_TOO_LARGE, 'Signed token exceeds the configured byte limit');

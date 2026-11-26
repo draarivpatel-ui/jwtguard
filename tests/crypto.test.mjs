@@ -47,8 +47,12 @@ for (const [algorithm, privateKey] of ALGORITHMS) {
   test(algorithm + ' rejects a tampered signature', (t) => {
     const token = signed({ exp: NOW + 100 }, algorithm, privateKey);
     const parts = token.split('.');
-    const last = parts[2].slice(-1) === 'Q' ? 'R' : 'Q';
-    parts[2] = parts[2].slice(0, -1) + last;
+    // Flip a bit in the decoded signature and re-encode canonically. Editing
+    // the base64url text directly can mutate pad bits instead of the
+    // signature, which changes the error code and made this test flaky.
+    const signature = Buffer.from(parts[2], 'base64url');
+    signature[signature.length - 1] ^= 0x01;
+    parts[2] = signature.toString('base64url');
     expectCode(t, () => verified(parts.join('.'), algorithm, PUBLIC[algorithm] || privateKey),
       'ERR_JWTGUARD_SIGNATURE_MISMATCH');
   });

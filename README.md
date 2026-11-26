@@ -6,7 +6,7 @@ Zero-dependency hardened JWT/JWS signing and verification for Node.js.
 
 - Zero runtime dependencies. Only `node:crypto` is used.
 - ESM (`src/index.mjs`), CommonJS (`cjs/index.cjs`) and strict TypeScript definitions (`types/index.d.ts`).
-- 150+ deterministic tests covering real cryptography and classic JWT CVEs.
+- 177 deterministic tests covering real cryptography and classic JWT CVEs.
 - Node.js 18 or newer.
 
 ## Install
@@ -44,13 +44,13 @@ const { signJwt, verifyJwt } = require('jwtguard');
 
 | Family | Algorithms | Key material |
 | --- | --- | --- |
-| HMAC | `HS256`, `HS384`, `HS512` | string or Buffer secret, at least 32, 48 or 64 bytes respectively |
-| RSA PKCS#1 v1.5 | `RS256` | RSA private key for signing, RSA public key for verification |
-| RSA-PSS | `PS256` | RSA private key for signing, RSA public key for verification |
+| HMAC | `HS256`, `HS384`, `HS512` | string, Buffer or Uint8Array secret, at least 32, 48 or 64 bytes respectively |
+| RSA PKCS#1 v1.5 | `RS256` | RSA private key for signing, RSA public key for verification; modulus of at least 2048 bits |
+| RSA-PSS | `PS256` | RSA private key for signing, RSA public key for verification; modulus of at least 2048 bits |
 | ECDSA P-256 | `ES256` | EC private key for signing, EC public key for verification; raw IEEE P1363 signatures |
 | Ed25519 | `EdDSA` | Ed25519 private key for signing, Ed25519 public key for verification |
 
-Keys may be PEM strings, Buffers or `crypto.KeyObject` instances. HMAC comparisons use `crypto.timingSafeEqual`.
+Keys may be PEM strings, Buffers, Uint8Arrays or `crypto.KeyObject` instances. Both signing and verification check the key family and curve, and RSA moduli below 2048 bits are rejected. HMAC comparisons use `crypto.timingSafeEqual`.
 
 ## API
 
@@ -71,7 +71,7 @@ Verifies structure, header policy, signature and claims. `options.algorithms` is
 - `clockToleranceSeconds`: allowed skew for `exp`, `nbf` and `iat`.
 - `requiredClaims`: claim names that must be present. Defaults to `['exp']`.
 - `issuer`, `audience`, `subject`, `jwtId`: expected claim values.
-- `maxAgeSeconds`: reject tokens older than this relative to `iat`.
+- `maxAgeSeconds`: reject tokens older than this relative to `iat`. Tokens without an `iat` claim are rejected rather than silently exempted.
 - `maxTokenBytes`: cap accepted token size.
 - `allowDangerousHeaders`: explicit opt-in list from `jku`, `x5u`, `jwk`, `x5c`.
 
@@ -99,11 +99,11 @@ Every error has a stable `code` such as `ERR_JWTGUARD_EXPIRED`, `ERR_JWTGUARD_KE
 
 Defenses included:
 
-- **Algorithm confusion.** The allowlist is mandatory and checked against the header before any key is used. `none` in any casing is always rejected. RSA public keys presented as HMAC secrets are rejected by key-type detection. Symmetric secrets presented to asymmetric algorithms are rejected. RSA, PSS, EC and Ed25519 keys are additionally checked for the correct key family and curve.
-- **Weak secrets.** HMAC keys shorter than 32, 48 or 64 bytes are rejected for HS256, HS384 and HS512.
-- **Header injection.** `jku`, `x5u`, `jwk` and `x5c` are blocked by default, since honoring them enables remote key injection and SSRF. `kid` is checked for path traversal, control characters, null bytes and SQL-injection patterns. Unknown `crit` headers are rejected as required by RFC 7515.
+- **Algorithm confusion.** The allowlist is mandatory and checked against the header before any key is used. `none` in any casing is always rejected. RSA public keys presented as HMAC secrets are rejected by key-type detection, including raw DER `SubjectPublicKeyInfo`, PKCS#1 and PKCS#8 blobs that carry no PEM armor. Symmetric secrets presented to asymmetric algorithms are rejected. Signing and verification both check the key family and curve, so a mislabelled algorithm and key pair can never produce a token.
+- **Weak secrets and keys.** HMAC keys shorter than 32, 48 or 64 bytes are rejected for HS256, HS384 and HS512. RSA keys below 2048 bits are rejected.
+- **Header injection.** `jku`, `x5u`, `jwk` and `x5c` are blocked by default, since honoring them enables remote key injection and SSRF. `kid` is checked for path traversal, control characters, null bytes and SQL-injection patterns. `crit` is fully enforced: naming a registered RFC 7515 header is rejected, and so is any extension this library does not implement.
 - **Parser attacks.** Duplicate JSON keys, including escaped duplicates, are rejected before `JSON.parse`. Prototype-pollution keys (`__proto__`, `constructor`, `prototype`) are rejected anywhere in the header or payload. Non-canonical base64url, padding and trailing garbage are rejected. Token size and JSON depth are capped.
-- **Claim attacks.** `exp` is required by default. `nbf`, `iat`, `iss`, `aud`, `sub`, `jti`, `maxAgeSeconds` and configurable clock tolerance are enforced with an injectable clock for deterministic tests.
+- **Claim attacks.** `exp` is required by default. `nbf`, `iat`, `iss`, `aud`, `sub`, `jti`, `maxAgeSeconds` and configurable clock tolerance are enforced with an injectable clock for deterministic tests. `maxAgeSeconds` requires `iat`, and payloads may contain only JSON data, so the object that is validated is exactly the object that is signed.
 
 Compared with general-purpose JWT libraries that infer the algorithm from the token and accept many header forms by default, `jwtguard` deliberately rejects anything it cannot verify safely. It does not implement JWE encryption, JWKS fetching or key rotation; those belong in separate, audited components. See `GOOD_FIRST_ISSUES.md` for planned adapters.
 

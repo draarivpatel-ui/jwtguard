@@ -87,7 +87,9 @@ test('JWS signatures are compared over the exact original encoded bytes', (t) =>
     .update(parts[0] + '.' + parts[1]).digest('base64url');
   assert.equal(parts[2], recomputed);
   assert.equal(verified(token, 'HS256', HS256_SECRET).exp, NOW + 10);
-  expectCode(t, () => esm.verifyJwt(token.replace('.' + parts[2], '.' + recomputed.slice(0, -1) + 'A'),
+  const flipped = Buffer.from(recomputed, 'base64url');
+  flipped[0] ^= 0x01;
+  expectCode(t, () => esm.verifyJwt(parts[0] + '.' + parts[1] + '.' + flipped.toString('base64url'),
     HS256_SECRET, { algorithms: ['HS256'], now: NOW }), 'ERR_JWTGUARD_SIGNATURE_MISMATCH');
 });
 

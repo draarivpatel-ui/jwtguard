@@ -81,10 +81,15 @@ test('crit must be a non-empty array of unique strings', (t) => {
   }
 });
 
-test('crit can list other understood registered headers', () => {
-  const token = rawToken({ alg: 'HS256', crit: ['typ', 'kid'], typ: 'JWT', kid: 'k1' },
-    { exp: NOW + 10 });
-  assert.equal(esm.inspectJwtHeader(token, { enforcePolicy: true }).kid, 'k1');
+test('crit may not name an RFC 7515 registered header', (t) => {
+  // RFC 7515 section 4.1.11: crit MUST NOT list headers defined by the JWS or
+  // JWA specifications. The library implements no crit extensions, so any
+  // crit array is rejected.
+  for (const crit of [['typ', 'kid'], ['alg'], ['crit']]) {
+    const token = rawToken({ alg: 'HS256', crit, typ: 'JWT', kid: 'k1' }, { exp: NOW + 10 });
+    expectCode(t, () => esm.inspectJwtHeader(token, { enforcePolicy: true }),
+      'ERR_JWTGUARD_UNKNOWN_CRIT');
+  }
 });
 
 test('duplicate JSON keys in header or payload are rejected', (t) => {

@@ -16,6 +16,7 @@ declare module 'jwtguard' {
     | 'ERR_JWTGUARD_UNKNOWN_CRIT'
     | 'ERR_JWTGUARD_KEY_TYPE_MISMATCH'
     | 'ERR_JWTGUARD_WEAK_SECRET'
+    | 'ERR_JWTGUARD_WEAK_KEY'
     | 'ERR_JWTGUARD_INVALID_KEY'
     | 'ERR_JWTGUARD_INVALID_SIGNATURE'
     | 'ERR_JWTGUARD_SIGNATURE_MISMATCH'
@@ -65,7 +66,8 @@ declare module 'jwtguard' {
   export interface DecodedJwt {
     readonly header: JwtHeader;
     readonly payload: JwtPayload;
-    readonly signature: string;
+    /** Raw signature bytes (a Buffer, which is a Uint8Array). */
+    readonly signature: Uint8Array;
     readonly signingInput: string;
   }
 
@@ -98,6 +100,7 @@ declare module 'jwtguard' {
     audience?: string | readonly string[];
     subject?: string;
     jwtId?: string;
+    /** Requires an iat claim; tokens without iat are rejected. */
     maxAgeSeconds?: number;
     maxTokenBytes?: number;
     /** Headers that are otherwise blocked by default. Use with care. */

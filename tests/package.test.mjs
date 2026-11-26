@@ -119,9 +119,9 @@ test('tracked source files contain no internal paths, personal data or fancy das
 
 test('README states an honest test count', async () => {
   const files = (await readdir(path.join(root, 'tests'))).filter((name) => name.endsWith('.test.mjs'));
-  assert.equal(files.length, 7);
+  assert.equal(files.length, 8);
   const readme = await readFile(path.join(root, 'README.md'), 'utf8');
-  assert.match(readme, /150\+ deterministic tests/i);
+  assert.match(readme, /\b177 deterministic tests\b/i);
 });
 
 test('types cover the full public API', async () => {
