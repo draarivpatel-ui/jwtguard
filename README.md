@@ -1,5 +1,7 @@
 # jwtguard
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/draarivpatel-ui/jwtguard/badge)](https://scorecard.dev/viewer/?uri=github.com/draarivpatel-ui/jwtguard)
+
 Zero-dependency hardened JWT/JWS signing and verification for Node.js.
 
 `jwtguard` targets the security gap left by permissive JWT libraries. It never guesses an algorithm from an untrusted token, never accepts `alg: none`, and never lets a public PEM become an HMAC secret.
