@@ -24,6 +24,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node }}
+
+      - name: Install development dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Verify generated CommonJS build is current
         shell: bash
         run: |
@@ -33,3 +36,5 @@ jobs:
       - name: Run deterministic test suite
         shell: bash
         run: node --test tests/*.test.mjs
+      - name: Run fast-check property fuzz tests
+        run: npm run test:fuzz

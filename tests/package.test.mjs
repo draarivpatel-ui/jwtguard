@@ -10,7 +10,7 @@ import {
 
 const require = createRequire(import.meta.url);
 
-test('package.json declares a strict zero-dependency dual module', async () => {
+test('package.json declares a strict zero-runtime-dependency dual module', async () => {
   const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
   assert.equal(pkg.name, '@aarivbuildz/jwtguard');
   assert.equal(pkg.type, 'module');
@@ -18,7 +18,7 @@ test('package.json declares a strict zero-dependency dual module', async () => {
   assert.equal(pkg.module, './src/index.mjs');
   assert.equal(pkg.types, './types/index.d.ts');
   assert.deepEqual(pkg.dependencies, {});
-  assert.deepEqual(pkg.devDependencies, {});
+  assert.deepEqual(pkg.devDependencies, { 'fast-check': '4.10.3' });
   assert.equal(pkg.exports['.'].import, './src/index.mjs');
   assert.equal(pkg.exports['.'].require, './cjs/index.cjs');
   assert.equal(pkg.exports['.'].types, './types/index.d.ts');
